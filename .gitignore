@@ -40,6 +40,15 @@ samples/
 wandb/
 *.log
 
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.synctex.gz
+
 # FID stats
 fid_stats/
 
