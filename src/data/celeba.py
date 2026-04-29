@@ -12,12 +12,11 @@ What you need to implement:
 """
 
 import os
-from typing import Optional, Tuple, Callable
+from typing import Callable, Optional
 
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from torchvision.transforms import functional as TF
 from torchvision.utils import make_grid as torch_make_grid
 from torchvision.utils import save_image as torch_save_image
 from PIL import Image
@@ -57,7 +56,7 @@ class CelebADataset(Dataset):
         self.repo_name = repo_name
 
         # Build transforms
-        self.transform = self._build_transforms() # TODO write your own image transform function
+        self.transform = self._build_transforms()
 
         # Load dataset based on mode
         if from_hub:
@@ -213,7 +212,7 @@ class CelebADataset(Dataset):
             raise FileNotFoundError(
                 f"Images directory not found: {images_dir}\n"
                 f"Please download the dataset first using:\n"
-                f"  python dataset_processing/download_dataset.py"
+                f"  python download_dataset.py --output_dir {self.root} --split all"
             )
 
         # Get all image files
@@ -233,15 +232,20 @@ class CelebADataset(Dataset):
     
     def _build_transforms(self) -> Callable:
         """Build the preprocessing transforms."""
-        transform_list = []
+        transform_list: list[Callable] = [
+            transforms.Lambda(lambda image: image.convert("RGB")),
+        ]
 
-        # TODO: write your image transforms & augmentation
+        if self.image_size != 64:
+            transform_list.append(transforms.Resize((self.image_size, self.image_size)))
 
-        # Only resize if needed (dataset images are already 64x64)
+        if self.augment and self.split == "train":
+            transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
 
-        # For Data augmentation you can do something like
-        # if self.augment and self.split == "train":
-        #     transform_list.append(...)
+        transform_list.extend([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ])
 
         return transforms.Compose(transform_list)
 
