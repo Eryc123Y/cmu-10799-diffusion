@@ -13,6 +13,13 @@ from .base import BaseMethod
 
 
 class DDPM(BaseMethod):
+    betas: torch.Tensor
+    alphas: torch.Tensor
+    alpha_bars: torch.Tensor
+    sqrt_alpha_bars: torch.Tensor
+    sqrt_one_minus_alpha_bars: torch.Tensor
+    posterior_variance: torch.Tensor
+
     def __init__(
         self,
         model: nn.Module,
@@ -20,14 +27,58 @@ class DDPM(BaseMethod):
         num_timesteps: int,
         beta_start: float,
         beta_end: float,
-        # TODO: Add your own arguments here
     ):
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
-        self. beta_start = beta_start
-        self. beta_end = beta_end
-        # TODO: Implement your own init
+        self.beta_start = beta_start
+        self.beta_end = beta_end
+
+        # Fixed DDPM noise schedule. These tensors are buffers: they are not
+        # optimized, but they are saved in state_dict and should move with the
+        # method. Index t always means the coefficient for timestep t.
+        betas = torch.linspace(
+            beta_start,
+            beta_end,
+            self.num_timesteps,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        # beta_t: noise variance added in the forward process at timestep t.
+        # alpha_t = 1 - beta_t: signal retained by one forward noising step.
+        # alpha_bar_t: cumulative signal retained from x_0 to x_t.
+        alphas = 1.0 - betas
+        alpha_bars = torch.cumprod(alphas, dim=0)
+
+        # alpha_bars_prev[t] represents alpha_bar_{t-1}. For t = 0, the
+        # previous cumulative product is defined as 1 because no noising step
+        # has happened before x_0.
+        alpha_bars_prev = torch.cat(
+            [
+                torch.ones(1, device=device, dtype=torch.float32),
+                alpha_bars[:-1],
+            ]
+        )
+
+        # Posterior variance beta_tilde_t for q(x_{t-1} | x_t, x_0).
+        # This is the variance term used by the stochastic reverse step.
+        posterior_variance = (
+            betas * (1.0 - alpha_bars_prev) / (1.0 - alpha_bars)
+        )
+
+        self.register_buffer("betas", betas)
+        self.register_buffer("alphas", alphas)
+        self.register_buffer("alpha_bars", alpha_bars)
+        # Forward noising coefficients:
+        # x_t = sqrt(alpha_bar_t) * x_0
+        #       + sqrt(1 - alpha_bar_t) * epsilon.
+        self.register_buffer("sqrt_alpha_bars", torch.sqrt(alpha_bars))
+        self.register_buffer(
+            "sqrt_one_minus_alpha_bars",
+            torch.sqrt(1.0 - alpha_bars),
+        )
+        self.register_buffer("posterior_variance", posterior_variance)
 
     # =========================================================================
     # You can add, delete or modify as many functions as you would like
@@ -39,14 +90,69 @@ class DDPM(BaseMethod):
 
     # Pro tips 2: If you need a specific broadcasting for your tensors,
     # it's a good idea to write a general helper function for that
+
+    def _extract(
+        self,
+        values: torch.Tensor,
+        t: torch.Tensor,
+        x_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """
+        Select timestep-specific coefficients and reshape them for broadcasting.
+
+        Args:
+            values: Full schedule tensor with shape (num_timesteps,).
+            t: Batch timesteps with shape (batch_size,).
+            x_shape: Shape of the target tensor, usually (B, C, H, W).
+
+        Returns:
+            Coefficients with shape (B, 1, 1, 1) for image tensors, or the
+            equivalent broadcastable shape for other x-like tensors.
+        """
+        if t.ndim != 1:
+            raise ValueError(f"Expected t to have shape (batch_size,), got {t.shape}")
+
+        t = t.to(device=values.device, dtype=torch.long)
+        out = values.gather(0, t)
+
+        # Keep the batch dimension and add singleton dimensions so the selected
+        # schedule values broadcast across channels, height, and width.
+        broadcast_shape = (t.shape[0],) + (1,) * (len(x_shape) - 1)
+        return out.reshape(broadcast_shape)
     
     # =========================================================================
     # Forward process
     # =========================================================================
 
-    def forward_process(self): # TODO: Add your own arguments here
-        # TODO: Implement the forward (noise adding) process of DDPM
-        raise NotImplementedError
+    def forward_process(
+        self,
+        x_0: torch.Tensor,
+        t: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x_0.shape[0] != t.shape[0]:
+            raise ValueError(
+                "Batch size of x_0 and t must match, "
+                f"got {x_0.shape[0]} and {t.shape[0]}"
+            )
+        
+        noise = torch.randn_like(x_0)
+        sqrt_alpha_bar_t = self._extract(
+            self.sqrt_alpha_bars,
+            t,
+            x_0.shape,
+        )
+        sqrt_one_minus_alpha_bar_t = self._extract(
+            self.sqrt_one_minus_alpha_bars,
+            t,
+            x_0.shape,
+        )
+
+        x_t = (
+            sqrt_alpha_bar_t * x_0
+            + sqrt_one_minus_alpha_bar_t * noise
+        )
+        return x_t, noise
+
 
     # =========================================================================
     # Training loss
