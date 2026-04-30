@@ -18,7 +18,7 @@ Architecture Overview:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 from .blocks import (
     TimestepEmbedding,
@@ -32,7 +32,7 @@ from .blocks import (
 
 class UNet(nn.Module):
     """
-    TODO: design your own U-Net architecture for diffusion models.
+    Timestep-conditioned U-Net for DDPM noise prediction.
 
     Args:
         in_channels: Number of input image channels (3 for RGB)
@@ -74,6 +74,7 @@ class UNet(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         use_scale_shift_norm: bool = True,
+        image_size: int = 64,
     ):
         super().__init__()
         
@@ -86,13 +87,117 @@ class UNet(nn.Module):
         self.num_heads = num_heads
         self.dropout = dropout
         self.use_scale_shift_norm = use_scale_shift_norm
-        
-        # TODO: build your own unet architecture here
-        # Pro tips: remember to take care of the time embeddings!
+        self.image_size = image_size
+
+        time_embed_dim = base_channels * 4
+        self.time_embedding = TimestepEmbedding(time_embed_dim)
+
+        self.input_conv = nn.Conv2d(
+            in_channels,
+            base_channels,
+            kernel_size=3,
+            padding=1,
+        )
+
+        self.down_blocks = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+        self.skip_channels: list[int] = []
+
+        current_channels = base_channels
+        current_resolution = image_size
+
+        for level, mult in enumerate(channel_mult):
+            out_channels_for_level = base_channels * mult
+
+            for _ in range(num_res_blocks):
+                block = self._make_res_attention_block(
+                    in_channels=current_channels,
+                    out_channels=out_channels_for_level,
+                    time_embed_dim=time_embed_dim,
+                    current_resolution=current_resolution,
+                )
+                self.down_blocks.append(block)
+                current_channels = out_channels_for_level
+                self.skip_channels.append(current_channels)
+
+            if level != len(channel_mult) - 1:
+                self.down_blocks.append(Downsample(current_channels))
+                current_resolution = current_resolution // 2
+
+        self.middle_block1 = ResBlock(
+            current_channels,
+            current_channels,
+            time_embed_dim,
+            dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
+        )
+        self.middle_attention = AttentionBlock(current_channels, num_heads=num_heads)
+        self.middle_block2 = ResBlock(
+            current_channels,
+            current_channels,
+            time_embed_dim,
+            dropout=dropout,
+            use_scale_shift_norm=use_scale_shift_norm,
+        )
+
+        for level, mult in reversed(list(enumerate(channel_mult))):
+            out_channels_for_level = base_channels * mult
+
+            for _ in range(num_res_blocks):
+                skip_channels = self.skip_channels.pop()
+                block = self._make_res_attention_block(
+                    in_channels=current_channels + skip_channels,
+                    out_channels=out_channels_for_level,
+                    time_embed_dim=time_embed_dim,
+                    current_resolution=current_resolution,
+                )
+                self.up_blocks.append(block)
+                current_channels = out_channels_for_level
+
+            if level != 0:
+                self.up_blocks.append(Upsample(current_channels))
+                current_resolution = current_resolution * 2
+
+        self.output_norm = GroupNorm32(32, current_channels)
+        self.output_conv = nn.Conv2d(
+            current_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1,
+        )
+
+    def _make_res_attention_block(
+        self,
+        in_channels: int,
+        out_channels: int,
+        time_embed_dim: int,
+        current_resolution: int,
+    ) -> nn.ModuleDict:
+        """
+        Build one residual block, plus optional attention at this resolution.
+        """
+        attention: nn.Module
+        if current_resolution in self.attention_resolutions:
+            attention = AttentionBlock(out_channels, num_heads=self.num_heads)
+        else:
+            attention = nn.Identity()
+
+        return nn.ModuleDict(
+            {
+                "res": ResBlock(
+                    in_channels,
+                    out_channels,
+                    time_embed_dim,
+                    dropout=self.dropout,
+                    use_scale_shift_norm=self.use_scale_shift_norm,
+                ),
+                "attn": attention,
+            }
+        )
     
     def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        TODO: Implement the forward pass of the unet
+        Predict the DDPM target for a noisy image batch.
         
         Args:
             x: Input tensor of shape (batch_size, in_channels, height, width)
@@ -102,8 +207,45 @@ class UNet(nn.Module):
         Returns:
             Output tensor of shape (batch_size, out_channels, height, width)
         """
+        if t.ndim != 1:
+            raise ValueError(f"Expected t to have shape (batch_size,), got {t.shape}")
 
-        raise NotImplementedError
+        time_emb = self.time_embedding(t)
+
+        h = self.input_conv(x)
+        skip_connections: list[torch.Tensor] = []
+
+        for block in self.down_blocks:
+            if isinstance(block, Downsample):
+                h = block(h)
+            else:
+                h = block["res"](h, time_emb)
+                h = block["attn"](h)
+                skip_connections.append(h)
+
+        h = self.middle_block1(h, time_emb)
+        h = self.middle_attention(h)
+        h = self.middle_block2(h, time_emb)
+
+        for block in self.up_blocks:
+            if isinstance(block, Upsample):
+                h = block(h)
+            else:
+                skip = skip_connections.pop()
+                h = torch.cat([h, skip], dim=1)
+                h = block["res"](h, time_emb)
+                h = block["attn"](h)
+
+        h = self.output_norm(h)
+        h = F.silu(h)
+        output = self.output_conv(h)
+
+        if output.shape[2:] != x.shape[2:]:
+            raise ValueError(
+                f"Expected output spatial shape {x.shape[2:]}, got {output.shape[2:]}"
+            )
+
+        return output
 
 
 def create_model_from_config(config: dict) -> UNet:
@@ -130,6 +272,7 @@ def create_model_from_config(config: dict) -> UNet:
         num_heads=model_config['num_heads'],
         dropout=model_config['dropout'],
         use_scale_shift_norm=model_config['use_scale_shift_norm'],
+        image_size=data_config['image_size'],
     )
 
 

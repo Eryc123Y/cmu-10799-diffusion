@@ -2,8 +2,7 @@
 Denoising Diffusion Probabilistic Models (DDPM)
 """
 
-import math
-from typing import Dict, Tuple, Optional, Literal, List
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -13,6 +12,8 @@ from .base import BaseMethod
 
 
 class DDPM(BaseMethod):
+    # These attributes are created by register_buffer in __init__. The type
+    # annotations make them visible to static checkers such as Pylance/Pyright.
     betas: torch.Tensor
     alphas: torch.Tensor
     alpha_bars: torch.Tensor
@@ -28,15 +29,25 @@ class DDPM(BaseMethod):
         beta_start: float,
         beta_end: float,
     ):
+        """
+        Build the fixed DDPM schedules used by training and sampling.
+
+        Args:
+            model: Noise prediction network epsilon_theta(x_t, t).
+            device: Device where schedule buffers should be initialized.
+            num_timesteps: Number of discrete diffusion steps T.
+            beta_start: Initial forward-process noise variance.
+            beta_end: Final forward-process noise variance.
+        """
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
         self.beta_start = beta_start
         self.beta_end = beta_end
 
-        # Fixed DDPM noise schedule. These tensors are buffers: they are not
-        # optimized, but they are saved in state_dict and should move with the
-        # method. Index t always means the coefficient for timestep t.
+        # Fixed DDPM noise schedule. Each tensor has shape (T,), where index t
+        # stores the scalar coefficient for timestep t. Buffers are not
+        # optimized, but they are part of the module state.
         betas = torch.linspace(
             beta_start,
             beta_end,
@@ -45,9 +56,9 @@ class DDPM(BaseMethod):
             dtype=torch.float32,
         )
 
-        # beta_t: noise variance added in the forward process at timestep t.
-        # alpha_t = 1 - beta_t: signal retained by one forward noising step.
-        # alpha_bar_t: cumulative signal retained from x_0 to x_t.
+        # beta_t: variance of the Gaussian noise added at step t.
+        # alpha_t = 1 - beta_t: signal retained by one forward step.
+        # alpha_bar_t = product_{s<=t} alpha_s: signal retained from x_0 to x_t.
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
 
@@ -70,7 +81,7 @@ class DDPM(BaseMethod):
         self.register_buffer("betas", betas)
         self.register_buffer("alphas", alphas)
         self.register_buffer("alpha_bars", alpha_bars)
-        # Forward noising coefficients:
+        # Forward-process coefficients used by q(x_t | x_0):
         # x_t = sqrt(alpha_bar_t) * x_0
         #       + sqrt(1 - alpha_bar_t) * epsilon.
         self.register_buffer("sqrt_alpha_bars", torch.sqrt(alpha_bars))
@@ -81,15 +92,8 @@ class DDPM(BaseMethod):
         self.register_buffer("posterior_variance", posterior_variance)
 
     # =========================================================================
-    # You can add, delete or modify as many functions as you would like
+    # Schedule helpers
     # =========================================================================
-    
-    # Pro tips: If you have a lot of pseudo parameters that you will specify for each
-    # model run but will be fixed once you specified them (say in your config),
-    # then you can use super().register_buffer(...) for these parameters
-
-    # Pro tips 2: If you need a specific broadcasting for your tensors,
-    # it's a good idea to write a general helper function for that
 
     def _extract(
         self,
@@ -110,7 +114,9 @@ class DDPM(BaseMethod):
             equivalent broadcastable shape for other x-like tensors.
         """
         if t.ndim != 1:
-            raise ValueError(f"Expected t to have shape (batch_size,), got {t.shape}")
+            raise ValueError(
+                f"Expected t to have shape (batch_size,), got {t.shape}"
+            )
 
         t = t.to(device=values.device, dtype=torch.long)
         out = values.gather(0, t)
@@ -129,13 +135,28 @@ class DDPM(BaseMethod):
         x_0: torch.Tensor,
         t: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample x_t directly from q(x_t | x_0) for a batch of timesteps.
+
+        Args:
+            x_0: Clean images with shape (B, C, H, W).
+            t: One timestep per image with shape (B,).
+
+        Returns:
+            x_t: Noisy images with the same shape as x_0.
+            noise: The sampled epsilon target used to create x_t.
+        """
         if x_0.shape[0] != t.shape[0]:
             raise ValueError(
                 "Batch size of x_0 and t must match, "
                 f"got {x_0.shape[0]} and {t.shape[0]}"
             )
-        
+
+        # epsilon ~ N(0, I), sampled with the same shape, dtype, and device as x_0.
         noise = torch.randn_like(x_0)
+
+        # Extract per-sample coefficients and reshape them to (B, 1, 1, 1), so
+        # each image uses its own timestep while broadcasting across C, H, and W.
         sqrt_alpha_bar_t = self._extract(
             self.sqrt_alpha_bars,
             t,
@@ -158,20 +179,52 @@ class DDPM(BaseMethod):
     # Training loss
     # =========================================================================
 
-    def compute_loss(self, x_0: torch.Tensor, **kwargs) -> Tuple[torch.Tensor, Dict[str, float]]:
+    def compute_loss(
+        self,
+        x_0: torch.Tensor,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        TODO: Implement your DDPM loss function here
+        Train epsilon_theta(x_t, t) to predict the Gaussian noise epsilon.
 
         Args:
-            x_0: Clean data samples of shape (batch_size, channels, height, width)
-            **kwargs: Additional method-specific arguments
+            x_0: Clean image batch with shape (B, C, H, W).
+            **kwargs: Reserved for future method-specific arguments.
         
         Returns:
-            loss: Scalar loss tensor for backpropagation
-            metrics: Dictionary of metrics for logging (e.g., {'mse': 0.1})
+            loss: Scalar MSE loss tensor for backpropagation.
+            metrics: Float metrics for logging.
         """
+        batch_size = x_0.shape[0]
 
-        raise NotImplementedError
+        # Sample one timestep per image, so the model learns every noise level.
+        t = torch.randint(
+            low=0,
+            high=self.num_timesteps,
+            size=(batch_size,),
+            device=x_0.device,
+            dtype=torch.long,
+        )
+
+        # Build the supervised denoising pair:
+        # input to the model is x_t, target is the exact epsilon used to make it.
+        x_t, noise = self.forward_process(x_0, t)
+        pred_noise = self.model(x_t, t)
+
+        if pred_noise.shape != noise.shape:
+            raise ValueError(
+                f"Expected model output shape {noise.shape}, got {pred_noise.shape}"
+            )
+
+        # Baseline DDPM objective: ||epsilon - epsilon_theta(x_t, t)||^2.
+        loss = F.mse_loss(pred_noise, noise)
+        loss_value = loss.detach().item()
+        metrics = {
+            "loss": loss_value,
+            "mse": loss_value,
+        }
+        return loss, metrics
+
 
     # =========================================================================
     # Reverse process (sampling)
@@ -180,53 +233,117 @@ class DDPM(BaseMethod):
     @torch.no_grad()
     def reverse_process(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """
-        TODO: Implement one step of the DDPM reverse process
+        Sample one reverse DDPM step from p_theta(x_{t-1} | x_t).
 
         Args:
-            x_t: Noisy samples at time t (batch_size, channels, height, width)
-            t: the time
-            **kwargs: Additional method-specific arguments
+            x_t: Noisy images at timestep t with shape (B, C, H, W).
+            t: One timestep per image with shape (B,).
         
         Returns:
-            x_prev: Noisy samples at time t-1 (batch_size, channels, height, width)
+            x_prev: Images after one denoising step, with the same shape as x_t.
         """
-        raise NotImplementedError
+        if x_t.shape[0] != t.shape[0]:
+            raise ValueError(
+                "Batch size of x_t and t must match, "
+                f"got {x_t.shape[0]} and {t.shape[0]}"
+            )
+
+        beta_t = self._extract(self.betas, t, x_t.shape)
+        alpha_t = self._extract(self.alphas, t, x_t.shape)
+        alpha_bar_t = self._extract(self.alpha_bars, t, x_t.shape)
+        posterior_variance_t = self._extract(
+            self.posterior_variance,
+            t,
+            x_t.shape,
+        )
+
+        pred_noise = self.model(x_t, t)
+        if pred_noise.shape != x_t.shape:
+            raise ValueError(
+                f"Expected model output shape {x_t.shape}, got {pred_noise.shape}"
+            )
+
+        # Reverse mean:
+        # 1 / sqrt(alpha_t) * (x_t - beta_t / sqrt(1 - alpha_bar_t) * pred_noise)
+        noise_scale = beta_t / torch.sqrt(1.0 - alpha_bar_t)
+        mean = (
+            1.0 / torch.sqrt(alpha_t)
+        ) * (
+            x_t - noise_scale * pred_noise
+        )
+
+        # Add stochastic reverse noise for t > 0. At t = 0, the sample is the
+        # final image estimate, so the extra Gaussian noise is masked out.
+        reverse_noise = torch.randn_like(x_t)
+        variance_noise = torch.sqrt(posterior_variance_t) * reverse_noise
+        nonzero_mask = (t != 0).float()
+        broadcast_shape = (t.shape[0],) + (1,) * (len(x_t.shape) - 1)
+        nonzero_mask = nonzero_mask.reshape(broadcast_shape)
+
+        x_prev = mean + nonzero_mask * variance_noise
+        return x_prev
+
 
     @torch.no_grad()
     def sample(
         self,
         batch_size: int,
         image_shape: Tuple[int, int, int],
-        # TODO: add your arguments here
-        **kwargs
+        num_steps: int | None = None,
+        **kwargs,
     ) -> torch.Tensor:
         """
-        TODO: Implement DDPM sampling loop: start from pure noise, iterate through all the time steps using reverse_process()
+        Generate images by iteratively denoising from pure Gaussian noise.
 
         Args:
-            batch_size: Number of samples to generate
-            image_shape: Shape of each image (channels, height, width)
-            **kwargs: Additional method-specific arguments (e.g., num_steps)
+            batch_size: Number of samples to generate.
+            image_shape: Shape of each image as (channels, height, width).
+            num_steps: Optional number of reverse steps. The baseline sampler
+                currently supports the full DDPM chain only.
+            **kwargs: Reserved for future method-specific sampling arguments.
         
         Returns:
-            samples: Generated samples of shape (batch_size, *image_shape)
+            samples: Generated samples with shape (batch_size, *image_shape).
         """
+        if num_steps is not None and num_steps != self.num_timesteps:
+            raise NotImplementedError(
+                "This baseline DDPM sampler only supports the full reverse "
+                f"chain of {self.num_timesteps} steps; got num_steps={num_steps}."
+            )
+
         self.eval_mode()
-        raise NotImplementedError
+
+        # Start from x_T ~ N(0, I), one Gaussian noise image per requested sample.
+        sample_shape = (batch_size, *image_shape)
+        x_t = torch.randn(sample_shape, device=self.device)
+
+        for step in reversed(range(self.num_timesteps)):
+            # All images in this sampling batch are denoised at the same current
+            # step, but reverse_process expects one timestep per image: shape (B,).
+            t = torch.full(
+                (batch_size,),
+                step,
+                device=self.device,
+                dtype=torch.long,
+            )
+            x_t = self.reverse_process(x_t, t)
+
+        return x_t
 
     # =========================================================================
     # Device / state
     # =========================================================================
 
     def to(self, device: torch.device) -> "DDPM":
-        super().to(device)
+        nn.Module.to(self, device)
         self.device = device
         return self
 
     def state_dict(self) -> Dict:
         state = super().state_dict()
         state["num_timesteps"] = self.num_timesteps
-        # TODO: add other things you want to save
+        state["beta_start"] = self.beta_start
+        state["beta_end"] = self.beta_end
         return state
 
     @classmethod
@@ -238,5 +355,4 @@ class DDPM(BaseMethod):
             num_timesteps=ddpm_config["num_timesteps"],
             beta_start=ddpm_config["beta_start"],
             beta_end=ddpm_config["beta_end"],
-            # TODO: add your parameters here
         )

@@ -25,14 +25,16 @@ What you need to implement:
 import os
 import sys
 import argparse
+import math
 from datetime import datetime
+from typing import Optional
 
 import yaml
 import torch
 from tqdm import tqdm
 
 from src.models import create_model_from_config
-from src.data import save_image
+from src.data import save_image, unnormalize
 from src.methods import DDPM
 from src.utils import EMA
 
@@ -56,18 +58,26 @@ def load_checkpoint(checkpoint_path: str, device: torch.device):
 def save_samples(
     samples: torch.Tensor,
     save_path: str,
-    num_samples: int,
+    num_samples: Optional[int] = None,
+    nrow: Optional[int] = None,
 ) -> None:
     """
-    TODO: save generated samples as images.
+    Save generated samples as one image or an image grid.
 
     Args:
         samples: Generated samples tensor with shape (num_samples, C, H, W).
         save_path: File path to save the image grid.
         num_samples: Number of samples, used to calculate grid layout.
+        nrow: Optional explicit number of images per row.
     """
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
 
-    raise NotImplementedError
+    if nrow is None:
+        sample_count = num_samples if num_samples is not None else samples.shape[0]
+        nrow = max(1, int(math.sqrt(sample_count)))
+
+    images = unnormalize(samples.detach().cpu()).clamp(0.0, 1.0)
+    save_image(images, save_path, nrow=nrow)
 
 
 def main():
