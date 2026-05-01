@@ -41,7 +41,17 @@ from src.utils import EMA
 
 def load_checkpoint(checkpoint_path: str, device: torch.device):
     """Load checkpoint and return model, config, and EMA."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        # PyTorch 2.6 changed the default checkpoint loading behavior.
+        # HW1 checkpoints store Python config dicts, so we load the full file.
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=device,
+            weights_only=False,
+        )
+    except TypeError:
+        # Older PyTorch versions do not support the weights_only argument.
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint['config']
     
     # Create model
