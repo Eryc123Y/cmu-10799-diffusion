@@ -9,24 +9,130 @@ In this part of the homework, we will explore different design choices of the DD
 \subq{a}{7} The original DDPM paper parametrized the model to predict the noise $\epsilon$. However, this is not the only option! First derive an alternative parametrization for the same model (i.e. what else can the model predict that can still yield the same mathematical formulation of the algorithm).
 
 \answerbox{}{
-% Your answer here
-\vspace{14cm} % comment this line out after you put in your answers
+The forward process can be written as
+\[
+x_t
+=
+\sqrt{\bar{\alpha}_t}x_0
++
+\sqrt{1-\bar{\alpha}_t}\epsilon,
+\qquad
+\epsilon \sim \mathcal{N}(0,I).
+\]
+The original DDPM parameterization trains the network to predict
+\(\epsilon\). This is convenient because once we have
+\(\hat{\epsilon}_\theta(x_t,t)\), we can estimate
+\[
+\hat{x}_0
+=
+\frac{x_t-\sqrt{1-\bar{\alpha}_t}\hat{\epsilon}_\theta(x_t,t)}
+{\sqrt{\bar{\alpha}_t}},
+\]
+and then use this estimate inside the reverse mean.
+
+An equivalent alternative is to train the model to predict \(x_0\) directly:
+\[
+y_\theta(x_t,t)=\hat{x}_{0,\theta}(x_t,t),
+\qquad
+y=x_0.
+\]
+This still gives the same DDPM reverse formulation because the corresponding
+noise prediction can be recovered by rearranging the forward-process equation:
+\[
+\hat{\epsilon}_\theta(x_t,t)
+=
+\frac{x_t-\sqrt{\bar{\alpha}_t}\hat{x}_{0,\theta}(x_t,t)}
+{\sqrt{1-\bar{\alpha}_t}}.
+\]
+
+Another common alternative is the velocity parameterization
+\[
+v_t
+=
+\sqrt{\bar{\alpha}_t}\epsilon
+-
+\sqrt{1-\bar{\alpha}_t}x_0.
+\]
+If the network predicts \(\hat{v}_\theta(x_t,t)\), then both \(x_0\) and
+\(\epsilon\) can be recovered by the linear inverse:
+\[
+\hat{x}_{0,\theta}
+=
+\sqrt{\bar{\alpha}_t}x_t
+-
+\sqrt{1-\bar{\alpha}_t}\hat{v}_\theta(x_t,t),
+\]
+\[
+\hat{\epsilon}_\theta
+=
+\sqrt{1-\bar{\alpha}_t}x_t
++
+\sqrt{\bar{\alpha}_t}\hat{v}_\theta(x_t,t).
+\]
+Thus, velocity prediction is only a different coordinate system for the same
+two-dimensional linear relationship between \(x_0\), \(\epsilon\), and \(x_t\).
+
+A more score-matching-flavored option is to predict the score of
+\(q(x_t|x_0)\):
+\[
+s_t
+=
+\nabla_{x_t}\log q(x_t|x_0)
+=
+-\frac{\epsilon}{\sqrt{1-\bar{\alpha}_t}}.
+\]
+From a score prediction \(\hat{s}_\theta(x_t,t)\), we can recover
+\[
+\hat{\epsilon}_\theta
+=
+-\sqrt{1-\bar{\alpha}_t}\hat{s}_\theta(x_t,t).
+\]
+Therefore, \(x_0\)-prediction, velocity-prediction, and score-prediction can all
+be converted back into the noise prediction required by the DDPM reverse step.
+They differ in the supervised target and scaling seen during training, not in
+whether the reverse process can be mathematically formed.
 }
 \includeanswer{q6a}
 
 \subq{b}{10} Now implement your derived parametrization and train a model with the same configuration with your previous DDPM implementation with the only difference being the model parametrization. Include a grid of 16 samples and report your KID below. (Budget tip: You can compare the two parameterizations using shorter training runs, as long as they provide meaningful comparisons.)
 
 \answerbox{}{
-% Your answer here
-\vspace{10cm} % comment this line out after you put in your answers
+Implementation status before the full Colab run: the DDPM method has been
+extended so that the same U-Net architecture can be trained with four
+prediction targets: \(\epsilon\), \(x_0\), \(v\), and score. The configs for the
+four runs keep the dataset, model architecture, optimizer, EMA, noise schedule,
+batch size, and number of iterations fixed; the only intended algorithmic
+change is \texttt{ddpm.prediction\_type}.
+
+The full experimental results for this question are pending the Part IV Colab
+sweep. The runner will write the final sample grid and KID table to:
+\[
+\texttt{figures/q6\_final\_samples.png},
+\qquad
+\texttt{figures/q6\_kid\_table.csv}.
+\]
+After the run completes, this answer should be replaced with the actual 16
+sample grids and the KID mean/std for each successful parameterization. No KID
+numbers are reported here until the evaluation has actually been run.
 }
 \includeanswer{q6b}
 
 \subq{c}{3} Compare the performance of your new parametrization with that of the original parametrization. Share your findings below.
 
 \answerbox{}{
-% Your answer here
-\vspace{5cm} % comment this line out after you put in your answers
+The comparison will use \(\epsilon\)-prediction as the baseline and compare the
+alternative parameterizations using three kinds of evidence: final KID
+mean/std, qualitative samples, and training diagnostics. The training script now
+logs both the direct parameterization loss and comparable quantities such as
+noise MSE, \(x_0\) MSE, cosine similarity with the true noise, and timestep-bin
+noise MSE. This matters because the raw training loss is not directly
+comparable across \(\epsilon\), \(x_0\), \(v\), and score targets.
+
+This comparison is pending the full Colab sweep. The final answer should cite
+\texttt{figures/q6\_loss\_curves.png},
+\texttt{figures/q6\_noise\_mse\_curves.png},
+\texttt{figures/q6\_timestep\_bin\_heatmap.png}, and the KID table generated
+from the completed runs.
 }
 \includeanswer{q6c}
 
@@ -35,7 +141,34 @@ In this part of the homework, we will explore different design choices of the DD
 \subq{a}{10} DDPM typically uses 1000 timesteps for sampling, which is slow. How about using fewer steps? Report the KID scores for DDPM sampling algorithm with $100,300,500,700,900$ steps and compare with your original sampling with $1000$ steps. Include 1 sample for each number of steps to qualitatively show your comparisons as well.
 
 \answerbox{}{
-% Your answer here
-\vspace{10cm} % comment this line out after you put in your answers
+Implementation status before evaluation: the sampler now supports both the
+original full 1000-step stochastic DDPM reverse chain and a deterministic
+strided sampler for fewer steps. For \(N<1000\), the sampler selects \(N\)
+descending timesteps from \(999\) to \(0\). At each selected timestep it predicts
+\(\hat{\epsilon}_\theta\), reconstructs
+\[
+\hat{x}_0
+=
+\frac{x_t-\sqrt{1-\bar{\alpha}_t}\hat{\epsilon}_\theta}
+{\sqrt{\bar{\alpha}_t}},
+\]
+and jumps to the next selected timestep \(s\) with
+\[
+x_s
+=
+\sqrt{\bar{\alpha}_s}\hat{x}_0
++
+\sqrt{1-\bar{\alpha}_s}\hat{\epsilon}_\theta.
+\]
+Thus, the fewer-step sampler is a deterministic strided DDIM-style sampler using
+the DDPM-trained predictor, rather than the original adjacent-step posterior
+applied 1000 times.
+
+The KID table and sample comparison for \(100,300,500,700,900,1000\) steps are
+pending the Colab evaluation run. The runner will write the required outputs to
+\texttt{figures/q7\_kid\_table.csv},
+\texttt{figures/q7\_kid\_vs\_steps.png}, and
+\texttt{figures/q7\_sampling\_steps\_samples.png}. No KID values are reported
+until those files have been generated from an actual run.
 }
 \includeanswer{q7a}

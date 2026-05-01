@@ -12,6 +12,8 @@ from .base import BaseMethod
 
 
 class DDPM(BaseMethod):
+    VALID_PREDICTION_TYPES = {"epsilon", "x0", "v", "score"}
+
     # These attributes are created by register_buffer in __init__. The type
     # annotations make them visible to static checkers such as Pylance/Pyright.
     betas: torch.Tensor
@@ -28,6 +30,7 @@ class DDPM(BaseMethod):
         num_timesteps: int,
         beta_start: float,
         beta_end: float,
+        prediction_type: str = "epsilon",
     ):
         """
         Build the fixed DDPM schedules used by training and sampling.
@@ -38,12 +41,22 @@ class DDPM(BaseMethod):
             num_timesteps: Number of discrete diffusion steps T.
             beta_start: Initial forward-process noise variance.
             beta_end: Final forward-process noise variance.
+            prediction_type: What the model is trained to predict. Supported
+                values are "epsilon", "x0", "v", and "score".
         """
         super().__init__(model, device)
 
         self.num_timesteps = int(num_timesteps)
         self.beta_start = beta_start
         self.beta_end = beta_end
+        self.prediction_type = prediction_type
+
+        if self.prediction_type not in self.VALID_PREDICTION_TYPES:
+            valid_types = ", ".join(sorted(self.VALID_PREDICTION_TYPES))
+            raise ValueError(
+                f"Unknown DDPM prediction_type={prediction_type!r}. "
+                f"Expected one of: {valid_types}."
+            )
 
         # Fixed DDPM noise schedule. Each tensor has shape (T,), where index t
         # stores the scalar coefficient for timestep t. Buffers are not
@@ -125,6 +138,116 @@ class DDPM(BaseMethod):
         # schedule values broadcast across channels, height, and width.
         broadcast_shape = (t.shape[0],) + (1,) * (len(x_shape) - 1)
         return out.reshape(broadcast_shape)
+
+    def _alpha_bar_terms(
+        self,
+        t: torch.Tensor,
+        x_shape: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Return sqrt(alpha_bar_t) and sqrt(1 - alpha_bar_t) for x-shaped tensors.
+
+        These two coefficients are used by all parameterizations:
+        x_t = sqrt(alpha_bar_t) * x_0
+              + sqrt(1 - alpha_bar_t) * epsilon.
+        """
+        sqrt_alpha_bar_t = self._extract(self.sqrt_alpha_bars, t, x_shape)
+        sqrt_one_minus_alpha_bar_t = self._extract(
+            self.sqrt_one_minus_alpha_bars,
+            t,
+            x_shape,
+        )
+        return sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t
+
+    def _get_training_target(
+        self,
+        x_0: torch.Tensor,
+        x_t: torch.Tensor,
+        noise: torch.Tensor,
+        t: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Build the supervised target for the configured parameterization.
+
+        Args:
+            x_0: Clean images with shape (B, C, H, W).
+            x_t: Noisy images with shape (B, C, H, W).
+            noise: The Gaussian epsilon used to construct x_t.
+            t: One timestep per image with shape (B,).
+
+        Returns:
+            The target tensor with the same shape as x_0.
+        """
+        del x_t  # The target formulas use x_0, epsilon, and schedule terms.
+
+        sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t = self._alpha_bar_terms(
+            t,
+            x_0.shape,
+        )
+
+        if self.prediction_type == "epsilon":
+            return noise
+        if self.prediction_type == "x0":
+            return x_0
+        if self.prediction_type == "v":
+            # Velocity parameterization:
+            # v_t = sqrt(alpha_bar_t) * epsilon
+            #       - sqrt(1 - alpha_bar_t) * x_0.
+            return sqrt_alpha_bar_t * noise - sqrt_one_minus_alpha_bar_t * x_0
+        if self.prediction_type == "score":
+            # Score of q(x_t | x_0) with respect to x_t:
+            # grad log q(x_t | x_0) = -epsilon / sqrt(1 - alpha_bar_t).
+            return -noise / sqrt_one_minus_alpha_bar_t
+
+        raise RuntimeError(f"Unhandled prediction_type={self.prediction_type!r}")
+
+    def _prediction_to_noise(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        model_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert the raw model output into an epsilon prediction.
+
+        Sampling equations are easiest to keep correct if every
+        parameterization is first translated back to epsilon.
+        """
+        sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t = self._alpha_bar_terms(
+            t,
+            x_t.shape,
+        )
+
+        if self.prediction_type == "epsilon":
+            return model_output
+        if self.prediction_type == "x0":
+            return (x_t - sqrt_alpha_bar_t * model_output) / sqrt_one_minus_alpha_bar_t
+        if self.prediction_type == "v":
+            return sqrt_one_minus_alpha_bar_t * x_t + sqrt_alpha_bar_t * model_output
+        if self.prediction_type == "score":
+            return -sqrt_one_minus_alpha_bar_t * model_output
+
+        raise RuntimeError(f"Unhandled prediction_type={self.prediction_type!r}")
+
+    def _prediction_to_x0(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        model_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Convert the raw model output into a clean-image x_0 prediction.
+        """
+        sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t = self._alpha_bar_terms(
+            t,
+            x_t.shape,
+        )
+
+        if self.prediction_type == "x0":
+            return model_output
+
+        pred_noise = self._prediction_to_noise(x_t, t, model_output)
+        return (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
     
     # =========================================================================
     # Forward process
@@ -157,13 +280,7 @@ class DDPM(BaseMethod):
 
         # Extract per-sample coefficients and reshape them to (B, 1, 1, 1), so
         # each image uses its own timestep while broadcasting across C, H, and W.
-        sqrt_alpha_bar_t = self._extract(
-            self.sqrt_alpha_bars,
-            t,
-            x_0.shape,
-        )
-        sqrt_one_minus_alpha_bar_t = self._extract(
-            self.sqrt_one_minus_alpha_bars,
+        sqrt_alpha_bar_t, sqrt_one_minus_alpha_bar_t = self._alpha_bar_terms(
             t,
             x_0.shape,
         )
@@ -185,7 +302,7 @@ class DDPM(BaseMethod):
         **kwargs,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Train epsilon_theta(x_t, t) to predict the Gaussian noise epsilon.
+        Train the configured parameterization target from noisy images.
 
         Args:
             x_0: Clean image batch with shape (B, C, H, W).
@@ -206,23 +323,58 @@ class DDPM(BaseMethod):
             dtype=torch.long,
         )
 
-        # Build the supervised denoising pair:
-        # input to the model is x_t, target is the exact epsilon used to make it.
+        # Build the supervised denoising pair. The model always sees x_t and t,
+        # while the target can be epsilon, x_0, velocity, or score.
         x_t, noise = self.forward_process(x_0, t)
-        pred_noise = self.model(x_t, t)
+        target = self._get_training_target(x_0, x_t, noise, t)
+        model_output = self.model(x_t, t)
 
-        if pred_noise.shape != noise.shape:
+        if model_output.shape != target.shape:
             raise ValueError(
-                f"Expected model output shape {noise.shape}, got {pred_noise.shape}"
+                f"Expected model output shape {target.shape}, got {model_output.shape}"
             )
 
-        # Baseline DDPM objective: ||epsilon - epsilon_theta(x_t, t)||^2.
-        loss = F.mse_loss(pred_noise, noise)
+        # DDPM-style objective for the selected parameterization.
+        loss = F.mse_loss(model_output, target)
+
+        # Convert back to common quantities so different parameterizations can
+        # be compared on the same epsilon and x_0 scales.
+        pred_noise = self._prediction_to_noise(x_t, t, model_output)
+        pred_x0 = self._prediction_to_x0(x_t, t, model_output)
+
+        noise_mse = F.mse_loss(pred_noise, noise)
+        x0_mse = F.mse_loss(pred_x0, x_0)
+        noise_cosine = F.cosine_similarity(
+            pred_noise.flatten(start_dim=1),
+            noise.flatten(start_dim=1),
+            dim=1,
+        ).mean()
+        pred_norm = model_output.flatten(start_dim=1).norm(dim=1).mean()
+        target_norm = target.flatten(start_dim=1).norm(dim=1).mean()
+
         loss_value = loss.detach().item()
         metrics = {
             "loss": loss_value,
             "mse": loss_value,
+            "noise_mse": noise_mse.detach().item(),
+            "x0_mse": x0_mse.detach().item(),
+            "noise_cosine": noise_cosine.detach().item(),
+            "pred_norm": pred_norm.detach().item(),
+            "target_norm": target_norm.detach().item(),
         }
+
+        per_sample_noise_mse = (pred_noise - noise).square().flatten(start_dim=1).mean(dim=1)
+        bin_width = self.num_timesteps // 10
+        for bin_index in range(10):
+            bin_start = bin_index * bin_width
+            bin_end = self.num_timesteps - 1 if bin_index == 9 else (bin_start + bin_width - 1)
+            in_bin = (t >= bin_start) & (t <= bin_end)
+            metric_name = f"bin_{bin_start:03d}_{bin_end:03d}_noise_mse"
+            if in_bin.any():
+                metrics[metric_name] = per_sample_noise_mse[in_bin].mean().detach().item()
+            else:
+                metrics[metric_name] = float("nan")
+
         return loss, metrics
 
 
@@ -257,11 +409,12 @@ class DDPM(BaseMethod):
             x_t.shape,
         )
 
-        pred_noise = self.model(x_t, t)
-        if pred_noise.shape != x_t.shape:
+        model_output = self.model(x_t, t)
+        if model_output.shape != x_t.shape:
             raise ValueError(
-                f"Expected model output shape {x_t.shape}, got {pred_noise.shape}"
+                f"Expected model output shape {x_t.shape}, got {model_output.shape}"
             )
+        pred_noise = self._prediction_to_noise(x_t, t, model_output)
 
         # Reverse mean:
         # 1 / sqrt(alpha_t) * (x_t - beta_t / sqrt(1 - alpha_bar_t) * pred_noise)
@@ -283,6 +436,75 @@ class DDPM(BaseMethod):
         x_prev = mean + nonzero_mask * variance_noise
         return x_prev
 
+    def _build_sampling_timesteps(self, num_steps: int) -> torch.Tensor:
+        """
+        Build descending timestep indices for a strided sampler.
+
+        For example, num_steps=100 selects 100 indices from 999 down to 0.
+        The returned tensor has shape (num_steps,).
+        """
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}.")
+        if num_steps > self.num_timesteps:
+            raise ValueError(
+                f"num_steps cannot exceed {self.num_timesteps}, got {num_steps}."
+            )
+
+        if num_steps == self.num_timesteps:
+            return torch.arange(
+                self.num_timesteps - 1,
+                -1,
+                -1,
+                device=self.device,
+                dtype=torch.long,
+            )
+
+        timesteps = torch.linspace(
+            self.num_timesteps - 1,
+            0,
+            steps=num_steps,
+            device=self.device,
+        ).round().long()
+        return timesteps
+
+    @torch.no_grad()
+    def _ddim_strided_step(
+        self,
+        x_t: torch.Tensor,
+        current_step: int,
+        next_step: int,
+    ) -> torch.Tensor:
+        """
+        Deterministic strided DDIM-style jump from timestep t to timestep s.
+
+        This is used only when num_steps is smaller than the training diffusion
+        horizon. It reuses the trained DDPM predictor by converting its output
+        into epsilon, then reconstructing x_s from the predicted x_0.
+        """
+        batch_size = x_t.shape[0]
+        t = torch.full(
+            (batch_size,),
+            current_step,
+            device=self.device,
+            dtype=torch.long,
+        )
+        model_output = self.model(x_t, t)
+        if model_output.shape != x_t.shape:
+            raise ValueError(
+                f"Expected model output shape {x_t.shape}, got {model_output.shape}"
+            )
+
+        pred_noise = self._prediction_to_noise(x_t, t, model_output)
+        pred_x0 = self._prediction_to_x0(x_t, t, model_output)
+
+        if next_step < 0:
+            return pred_x0
+
+        alpha_bar_next = self.alpha_bars[next_step]
+        sqrt_alpha_bar_next = torch.sqrt(alpha_bar_next)
+        sqrt_one_minus_alpha_bar_next = torch.sqrt(1.0 - alpha_bar_next)
+        return sqrt_alpha_bar_next * pred_x0 + sqrt_one_minus_alpha_bar_next * pred_noise
+
 
     @torch.no_grad()
     def sample(
@@ -298,18 +520,17 @@ class DDPM(BaseMethod):
         Args:
             batch_size: Number of samples to generate.
             image_shape: Shape of each image as (channels, height, width).
-            num_steps: Optional number of reverse steps. The baseline sampler
-                currently supports the full DDPM chain only.
+            num_steps: Optional number of reverse steps. Full-length sampling
+                uses the stochastic DDPM chain; fewer steps use a deterministic
+                strided DDIM-style sampler.
             **kwargs: Reserved for future method-specific sampling arguments.
         
         Returns:
             samples: Generated samples with shape (batch_size, *image_shape).
         """
-        if num_steps is not None and num_steps != self.num_timesteps:
-            raise NotImplementedError(
-                "This baseline DDPM sampler only supports the full reverse "
-                f"chain of {self.num_timesteps} steps; got num_steps={num_steps}."
-            )
+        if num_steps is None:
+            num_steps = self.num_timesteps
+        timesteps = self._build_sampling_timesteps(num_steps)
 
         self.eval_mode()
 
@@ -317,16 +538,29 @@ class DDPM(BaseMethod):
         sample_shape = (batch_size, *image_shape)
         x_t = torch.randn(sample_shape, device=self.device)
 
-        for step in reversed(range(self.num_timesteps)):
+        if num_steps == self.num_timesteps:
+            for step in timesteps.tolist():
+                # All images in this sampling batch are denoised at the same current
+                # step, but reverse_process expects one timestep per image: shape (B,).
+                t = torch.full(
+                    (batch_size,),
+                    step,
+                    device=self.device,
+                    dtype=torch.long,
+                )
+                x_t = self.reverse_process(x_t, t)
+            return x_t
+
+        next_timesteps = torch.cat(
+            [
+                timesteps[1:],
+                torch.tensor([-1], device=self.device, dtype=torch.long),
+            ]
+        )
+        for current_step, next_step in zip(timesteps.tolist(), next_timesteps.tolist()):
             # All images in this sampling batch are denoised at the same current
-            # step, but reverse_process expects one timestep per image: shape (B,).
-            t = torch.full(
-                (batch_size,),
-                step,
-                device=self.device,
-                dtype=torch.long,
-            )
-            x_t = self.reverse_process(x_t, t)
+            # step, then jumped to the next selected timestep.
+            x_t = self._ddim_strided_step(x_t, current_step, next_step)
 
         return x_t
 
@@ -344,6 +578,7 @@ class DDPM(BaseMethod):
         state["num_timesteps"] = self.num_timesteps
         state["beta_start"] = self.beta_start
         state["beta_end"] = self.beta_end
+        state["prediction_type"] = self.prediction_type
         return state
 
     @classmethod
@@ -355,4 +590,5 @@ class DDPM(BaseMethod):
             num_timesteps=ddpm_config["num_timesteps"],
             beta_start=ddpm_config["beta_start"],
             beta_end=ddpm_config["beta_end"],
+            prediction_type=ddpm_config.get("prediction_type", "epsilon"),
         )

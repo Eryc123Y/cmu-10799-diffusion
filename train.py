@@ -26,6 +26,7 @@ Usage:
 import os
 import sys
 import argparse
+import csv
 import math
 import time
 from datetime import datetime
@@ -58,7 +59,15 @@ def load_config(config_path: str) -> dict:
 def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
     """Set up logging directories and wandb. Returns (log_dir, wandb_run)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_dir = os.path.join(config['logging']['dir'], f"{method_name}_{timestamp}")
+    logging_config = config['logging']
+    run_name = logging_config.get('run_name')
+    if run_name:
+        log_dir = os.path.join(logging_config['dir'], run_name)
+        wandb_run_name = run_name
+    else:
+        wandb_run_name = f"{method_name}_{timestamp}"
+        log_dir = os.path.join(logging_config['dir'], wandb_run_name)
+
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'samples'), exist_ok=True)
     os.makedirs(os.path.join(log_dir, 'checkpoints'), exist_ok=True)
@@ -71,13 +80,13 @@ def setup_logging(config: dict, method_name: str) -> tuple[str, Any]:
 
     # Initialize wandb if enabled
     wandb_run = None
-    wandb_config = config['logging'].get('wandb', {})
+    wandb_config = logging_config.get('wandb', {})
     if wandb_config.get('enabled', False):
         try:
             wandb_run = wandb.init(
                 project=wandb_config.get('project', 'cmu-10799-diffusion'),
                 entity=wandb_config.get('entity', None),
-                name=f"{method_name}_{timestamp}",
+                name=wandb_run_name,
                 config=config,
                 dir=log_dir,
                 tags=[method_name],
@@ -138,6 +147,57 @@ def reduce_metrics(
         tensor = tensor / world_size
         reduced[k] = tensor.item()
     return reduced
+
+
+def average_metric_values(values: list[float]) -> float:
+    """Average finite values and preserve NaN only when no finite value exists."""
+    finite_values = [value for value in values if math.isfinite(value)]
+    if not finite_values:
+        return float("nan")
+    return sum(finite_values) / len(finite_values)
+
+
+def metric_csv_fieldnames(num_timesteps: int) -> list[str]:
+    """Return the stable CSV schema used by Part IV analysis scripts."""
+    base_fields = [
+        "step",
+        "loss",
+        "mse",
+        "noise_mse",
+        "x0_mse",
+        "noise_cosine",
+        "pred_norm",
+        "target_norm",
+        "grad_norm",
+        "steps_per_sec",
+        "gpu_memory_gb",
+        "learning_rate",
+    ]
+
+    bin_width = num_timesteps // 10
+    bin_fields = []
+    for bin_index in range(10):
+        bin_start = bin_index * bin_width
+        bin_end = num_timesteps - 1 if bin_index == 9 else (bin_start + bin_width - 1)
+        bin_fields.append(f"bin_{bin_start:03d}_{bin_end:03d}_noise_mse")
+
+    return base_fields + bin_fields
+
+
+def open_metrics_csv(log_dir: str, num_timesteps: int) -> tuple[Any, csv.DictWriter]:
+    """Create the metrics.csv writer used for training curves and ablations."""
+    metrics_path = os.path.join(log_dir, "metrics.csv")
+    file_exists = os.path.exists(metrics_path) and os.path.getsize(metrics_path) > 0
+    metrics_file = open(metrics_path, "a", newline="")
+    writer = csv.DictWriter(
+        metrics_file,
+        fieldnames=metric_csv_fieldnames(num_timesteps),
+        extrasaction="ignore",
+    )
+    if not file_exists:
+        writer.writeheader()
+        metrics_file.flush()
+    return metrics_file, writer
 
 
 def create_optimizer(model: nn.Module, config: dict) -> torch.optim.Optimizer:
@@ -421,8 +481,11 @@ def train(
     # Setup logging
     log_dir = None
     wandb_run = None
+    metrics_file = None
+    metrics_writer = None
     if is_main_process:
         log_dir, wandb_run = setup_logging(config, method_name)
+        metrics_writer = None
 
     # Log model info to wandb
     if is_main_process and wandb_run is not None:
@@ -454,6 +517,10 @@ def train(
     save_every = training_config['save_every']
     num_samples = training_config['num_samples']
     gradient_clip_norm = training_config['gradient_clip_norm']
+    num_timesteps = config.get('ddpm', {}).get('num_timesteps', 1000)
+
+    if is_main_process and log_dir is not None:
+        metrics_file, metrics_writer = open_metrics_csv(log_dir, num_timesteps)
     
     # Image shape for sampling
     image_shape = (data_config['channels'], data_config['image_size'], data_config['image_size'])
@@ -538,17 +605,33 @@ def train(
         # Backward pass
         scaler.scale(loss).backward()
         
-        # Gradient clipping
+        # Gradient clipping. clip_grad_norm_ returns the total norm before the
+        # clipping scale is applied, which is useful for stability diagnostics.
+        grad_norm = torch.tensor(float("nan"), device=device)
         if gradient_clip_norm > 0:
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                gradient_clip_norm,
+            )
         
         # Optimizer step
         scaler.step(optimizer)
         scaler.update()
 
-        # EMA update - DISABLED
         ema.update()
+
+        metrics["grad_norm"] = (
+            grad_norm.detach().item()
+            if torch.is_tensor(grad_norm)
+            else float(grad_norm)
+        )
+        if device.type == "cuda":
+            metrics["gpu_memory_gb"] = (
+                torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+            )
+        else:
+            metrics["gpu_memory_gb"] = 0.0
         
         # Accumulate metrics (store raw values, will reduce when logging)
         for k, v in metrics.items():
@@ -563,7 +646,10 @@ def train(
             steps_per_sec = metrics_count / elapsed
 
             # Average metrics locally first
-            local_avg_metrics = {k: sum(v) / len(v) for k, v in metrics_sum.items()}
+            local_avg_metrics = {
+                k: average_metric_values(v)
+                for k, v in metrics_sum.items()
+            }
 
             # Reduce metrics across all ranks
             avg_metrics = reduce_metrics(local_avg_metrics, device, world_size)
@@ -574,6 +660,14 @@ def train(
                     'loss': f"{avg_metrics['loss']:.4f}",
                     'steps/s': f"{steps_per_sec:.2f}",
                 })
+                if metrics_writer is not None and metrics_file is not None:
+                    csv_row = {field: "" for field in metric_csv_fieldnames(num_timesteps)}
+                    csv_row.update(avg_metrics)
+                    csv_row["step"] = step + 1
+                    csv_row["steps_per_sec"] = steps_per_sec
+                    csv_row["learning_rate"] = optimizer.param_groups[0]['lr']
+                    metrics_writer.writerow(csv_row)
+                    metrics_file.flush()
 
             # Log to wandb
             if is_main_process and wandb_run is not None:
@@ -654,6 +748,9 @@ def train(
             wandb.finish()
         except Exception as e:
             print(f"Warning: Failed to finish wandb run: {e}")
+
+    if metrics_file is not None:
+        metrics_file.close()
 
     # Final barrier before cleanup
     if is_distributed:
