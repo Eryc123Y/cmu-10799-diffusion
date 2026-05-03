@@ -1,0 +1,5 @@
+- Q6 best parameterization: epsilon with KID 0.006382 ± 0.001630.
+- Q6 second best: v with KID 0.008808 ± 0.002058.
+- Q7 best reduced-step sampler: 500 steps with KID 0.010008 ± 0.002220.
+- Q7 1000-step baseline: KID 0.006382 ± 0.001630.
+- Raw training loss should not be compared directly across parameterizations; noise_mse and KID are the safer cross-parameterization quantities.

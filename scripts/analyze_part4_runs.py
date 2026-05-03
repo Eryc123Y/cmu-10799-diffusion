@@ -202,19 +202,24 @@ def make_q6_trajectory_grid(eval_dir: Path, runs: list[dict[str, Any]], output_p
     combine_tiles(tiles, output_path, columns=1)
 
 
-def first_png(directory: Path) -> Path | None:
+def nth_png(directory: Path, index: int) -> Path | None:
     pngs = sorted(directory.glob("*.png"))
     if not pngs:
         return None
-    return pngs[0]
+    if index >= len(pngs):
+        return pngs[-1]
+    return pngs[index]
 
 
 def make_q7_sample_grid(q7_table: Path, output_path: Path) -> None:
     rows = read_csv(q7_table)
     tiles = []
-    for row in rows:
+    for row_index, row in enumerate(rows):
         generated_dir = Path(row["generated_dir"])
-        image_path = first_png(generated_dir)
+        # Q7 evaluations reset the same seed for each step count. Use different
+        # indices per row so this preview is representative, not a same-index
+        # latent trajectory visualization.
+        image_path = nth_png(generated_dir, row_index)
         if image_path is None:
             print(f"No generated PNG found in {generated_dir}")
             continue

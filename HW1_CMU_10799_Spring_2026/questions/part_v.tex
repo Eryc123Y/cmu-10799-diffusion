@@ -7,8 +7,40 @@ Now that you have had a fully immersive experience with DDPM, let's take a step 
 \subq{a}{3} Based on your experience implementing and experimenting with DDPM: What do you think DDPM is bad at? Identify 2-3 limitations you observed or suspect. These could relate to sample quality, training efficiency, sampling speed, controllability, or anything else. Be specific—connect each limitation to something concrete from your experiments or implementation.
 
 \answerbox{}{
-% Your answer here
-\vspace{5cm} % comment this line out after you put in your answers
+\begin{itemize}
+\item DDPM is expensive to tune, debug, and compare. Even in this homework-scale
+setup, the design space already felt large: noise schedule, prediction
+parameterization, sampler choice, EMA usage, and architecture details can all
+affect the result. In Part IV, comparing only the prediction target and the
+number of sampling steps already required long training runs, KID evaluation on
+1k samples, and careful checkpoint handling. This makes iteration slow, and a
+broader model-selection process would be even more costly.
+
+\item DDPM sampling is slow. In Question 7, the best KID still came from the
+full 1000-step sampler, while reduced-step sampling was faster but consistently
+worse in quality. This shows that DDPM generation often relies on many
+sequential denoising steps, which makes inference expensive compared with
+models that generate outputs in a single forward pass.
+
+\item The optimization target is indirect and not always easy to interpret. The
+model does not directly learn to output a final image; instead, it learns a
+denoising-related target such as \(\epsilon\), \(x_0\), \(v\), or score. The
+training objective is also an expectation over the data, timestep, and sampled
+Gaussian noise:
+\[
+\mathcal{L}
+=
+\mathbb{E}_{x_0,t,\epsilon}
+\left[
+\|\epsilon - \epsilon_\theta(x_t,t)\|^2
+\right].
+\]
+In practice, this means the scalar training loss is not always a transparent
+indicator of final generation quality. In Part IV, the raw losses across
+parameterizations were not directly comparable, so I had to rely on KID,
+qualitative samples, and converted noise MSE to judge which models were
+actually better.
+\end{itemize}
 }
 \includeanswer{q7a}
 
@@ -16,23 +48,76 @@ Now that you have had a fully immersive experience with DDPM, let's take a step 
 (We're not asking you to implement these—just to think critically about the design space.)
 
 \answerbox{}{
-% Your answer here
-\vspace{5cm} % comment this line out after you put in your answers
+\begin{itemize}
+\item One improvement is to use faster samplers or distillation-based
+acceleration. DDIM-style deterministic sampling can reduce the number of
+reverse steps compared with the original DDPM sampler \citep{song2021ddim}, and
+progressive distillation is designed to compress many denoising steps into far
+fewer ones \citep{salimans2022progressive}. This would directly address the
+slow-inference problem I observed in Question 7, where the full 1000-step
+sampler gave the best quality but was also the most expensive.
+
+\item A second improvement is to use better training parameterizations and
+variance schedules. In this homework, the choice of prediction target mattered a
+lot: \(\epsilon\)-prediction was best, \(v\)-prediction was competitive, and the
+other choices were clearly worse. This suggests that some parameterizations are
+easier to optimize than others. Improved DDPM design choices, such as better
+noise schedules and learned reverse-process variances, can make training and
+sampling more stable and can reduce the amount of manual trial-and-error needed
+\citep{nichol2021improved}.
+
+\item A third improvement is to reduce the computational burden by moving the
+diffusion process into a lower-dimensional latent space instead of operating on
+pixels directly. Latent diffusion models follow this idea and show that much of
+the expensive denoising work can be done in a compressed representation while
+still producing strong image quality \citep{rombach2022ldm}. This seems
+especially relevant to my experience, because many of the practical difficulties
+in HW1 came from the cost of repeatedly training and evaluating pixel-space
+models.
+\end{itemize}
 }
 \includeanswer{q7b}
 
 \subq{c}{3} What ablations or experiments are you still curious about? List 1-2 things you would explore if you had more time and compute budget. Why do these interest you?
 
 \answerbox{}{
-% Your answer here
-\vspace{5cm} % comment this line out after you put in your answers
+\begin{itemize}
+\item I would like to run a larger parameterization study with longer training
+budgets and repeated seeds. In Part IV, \(\epsilon\)-prediction was best and
+\(v\)-prediction was close, but this conclusion came from one homework-scale
+training setup. I would be curious whether the ranking stays the same if the
+models are trained longer, if the learning rate is tuned separately for each
+parameterization, or if the comparison is averaged over multiple random seeds.
+This would help distinguish a real algorithmic advantage from a result that is
+partly due to limited compute or a lucky configuration.
+
+\item I would also like to study the tradeoff between sampler quality and speed
+more systematically. In Question 7, the 1000-step sampler was best, but 500-step
+sampling was the strongest reduced-step setting in this run. With more time, I
+would compare not only different numbers of steps but also different fast
+sampling methods, and I would record both KID and wall-clock generation time.
+This interests me because diffusion models are often limited by inference cost,
+so a good practical model is not just high-quality but also reasonably fast to
+sample from.
+\end{itemize}
 }
 \includeanswer{q7c}
 
 \subq{d}{1} List all the resources that you found helpful for this homework. Include AI tools, open source code, tutorials, papers, classmates that helped you, etc.
 
 \answerbox{}{
-% Your answer here
-\vspace{3cm} % comment this line out after you put in your answers
+\begin{itemize}
+\item CMU 10-799 course handout and homework specification.
+\item The provided starter code repository for HW1.
+\item The DDPM paper by \citet{ho2020ddpm}.
+\item The DDIM paper by \citet{song2021ddim}.
+\item The improved DDPM paper by \citet{nichol2021improved}.
+\item The latent diffusion paper by \citet{rombach2022ldm}.
+\item The CelebA dataset paper by \citet{liu2015faceattributes}.
+\item The \texttt{torch-fidelity} package for KID evaluation \citep{obukhov2020torchfidelity}.
+\item Google Colab for training and evaluation runs.
+\item AI tools used for explanation, debugging help, and report drafting:
+OpenAI Codex / ChatGPT.
+\end{itemize}
 }
 \includeanswer{q7d}

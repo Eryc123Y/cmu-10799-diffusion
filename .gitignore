@@ -40,6 +40,11 @@ samples/
 wandb/
 *.log
 
+# HW1 experiment result bundles
+HW1_CMU_10799_Spring_2026/part4_results_full_*/
+HW1_CMU_10799_Spring_2026/part4_results_full_*.zip
+ddpm-study-package.zip
+
 # LaTeX build artifacts
 *.aux
 *.bbl
@@ -70,3 +75,4 @@ temp/
 
 # AI files
 .claude/
+.omc/
