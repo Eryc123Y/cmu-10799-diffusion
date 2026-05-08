@@ -76,3 +76,6 @@ temp/
 # AI files
 .claude/
 .omc/
+
+# Local slide project source
+slides/fyp_ddpm_slides_captioned_source/
